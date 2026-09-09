@@ -21,6 +21,7 @@ import '../../media/media_item.dart';
 import '../../media/stepped_seek.dart';
 import '../../media/media_server_client.dart';
 import '../../mixins/context_menu_tap_mixin.dart';
+import '../../music_jam/music_jam_overlay.dart';
 import '../../services/device_performance.dart';
 import '../../services/music/music_playback_service.dart';
 import '../../theme/mono_motion.dart';
@@ -486,6 +487,7 @@ class _NowPlayingScreenState extends State<NowPlayingScreen>
                       style: TextStyle(fontSize: 13, color: tk.textMuted),
                     ),
             ),
+            const MusicJamButton(),
             _buildOverflowButton(track),
           ],
         ),
