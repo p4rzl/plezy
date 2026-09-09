@@ -24,6 +24,7 @@ import '../providers/seerr_account_provider.dart';
 import '../providers/trackers_provider.dart';
 import '../providers/watch_state_store.dart';
 import '../database/app_database.dart';
+import '../music_jam/music_jam_provider.dart';
 import '../screens/main_screen.dart';
 import '../screens/video_player_screen.dart';
 import '../services/api_cache.dart';
@@ -267,6 +268,12 @@ class _ProfileSessionScreenState extends State<ProfileSessionScreen> {
                 ),
               ),
               ChangeNotifierProvider(create: (context) => WatchTogetherProvider()),
+              ChangeNotifierProvider(
+                create: (context) => MusicJamProvider(
+                  musicService: context.read<MusicPlaybackService>(),
+                  multiServer: context.read<MultiServerProvider>(),
+                ),
+              ),
               ChangeNotifierProvider(
                 create: (context) {
                   final provider = CompanionRemoteProvider();
