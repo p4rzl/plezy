@@ -1,0 +1,48 @@
+name: Debug APK
+run-name: Debug APK ${{ github.sha }}
+
+# Unsigned debug build for personal testing — no code-signing secrets
+# required. The main Release workflow (build.yml) needs
+# ANDROID_KEYSTORE_BASE64/ANDROID_STORE_PASSWORD/ANDROID_KEY_PASSWORD/
+# ANDROID_KEY_ALIAS repository secrets to produce a signed release APK;
+# those aren't copied to forks, so this workflow exists as a fork-friendly
+# fallback that sidesteps signing entirely.
+
+on:
+  workflow_dispatch: {}
+
+env:
+  FLUTTER_VERSION: "3.47.1"
+
+jobs:
+  build-debug-apk:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup Java
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5
+        with:
+          distribution: "temurin"
+          java-version: "21"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Install dependencies
+        run: flutter pub get --enforce-lockfile --no-example
+
+      - name: Build debug APK
+        run: flutter build apk --debug
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: plezy-debug-apk
+          path: build/app/outputs/flutter-apk/app-debug.apk
