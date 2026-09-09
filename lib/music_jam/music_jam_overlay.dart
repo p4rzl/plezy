@@ -6,24 +6,32 @@ import 'package:material_symbols_icons/symbols.dart';
 import 'package:provider/provider.dart';
 
 import '../profiles/active_profile_provider.dart';
+import '../providers/multi_server_provider.dart';
+import '../services/music/music_playback_service.dart';
 import '../services/settings_service.dart';
 import '../utils/app_logger.dart';
 import '../utils/snackbar_helper.dart';
 import '../watch_together/models/watch_session.dart';
+import '../watch_together/providers/watch_together_provider.dart';
 import '../watch_together/services/watch_together_relay_endpoint.dart';
-import 'music_jam_provider.dart';
 
 /// Top-bar entry point for Listen Together: a plain icon when idle, a
-/// participant-count badge once a jam is active. Tapping opens the matching
-/// sheet (start/join, or the live session's roster).
+/// participant-count badge once a room is active. Tapping opens the
+/// matching sheet (start/join, or the live session's roster).
+///
+/// Drives the same [WatchTogetherProvider] Watch Together uses — a device
+/// is only ever in one room, video or music, at a time — so when a Watch
+/// Together video session is already active, this shows that room's
+/// roster/leave sheet instead of a music start/join sheet, rather than
+/// letting a jam silently replace it.
 class MusicJamButton extends StatelessWidget {
   const MusicJamButton({super.key});
 
   @override
   Widget build(BuildContext context) {
-    return Consumer<MusicJamProvider>(
-      builder: (context, jam, child) {
-        if (!jam.isInSession) {
+    return Consumer<WatchTogetherProvider>(
+      builder: (context, watchTogether, child) {
+        if (!watchTogether.isInSession) {
           return IconButton(
             icon: const Icon(Symbols.group_add_rounded),
             tooltip: 'Listen Together',
@@ -31,9 +39,9 @@ class MusicJamButton extends StatelessWidget {
           );
         }
         return _JamBadge(
-          participantCount: jam.participantCount,
-          isHost: jam.isHost,
-          onTap: () => _showSessionSheet(context, jam),
+          participantCount: watchTogether.participantCount,
+          isHost: watchTogether.isHost,
+          onTap: () => _showSessionSheet(context, watchTogether),
         );
       },
     );
@@ -76,25 +84,36 @@ class _JamBadge extends StatelessWidget {
 }
 
 void _showStartOrJoinSheet(BuildContext context) {
-  final jam = context.read<MusicJamProvider>();
-  unawaited(
-    showModalBottomSheet<void>(context: context, showDragHandle: true, builder: (sheetContext) => _StartOrJoinSheet(jam: jam)),
-  );
-}
-
-void _showSessionSheet(BuildContext context, MusicJamProvider jam) {
+  final watchTogether = context.read<WatchTogetherProvider>();
+  final musicService = context.read<MusicPlaybackService>();
+  final multiServer = context.read<MultiServerProvider>();
   unawaited(
     showModalBottomSheet<void>(
       context: context,
       showDragHandle: true,
-      builder: (sheetContext) => ListenableBuilder(listenable: jam, builder: (context, _) => _SessionSheet(jam: jam)),
+      builder: (sheetContext) =>
+          _StartOrJoinSheet(watchTogether: watchTogether, musicService: musicService, multiServer: multiServer),
+    ),
+  );
+}
+
+void _showSessionSheet(BuildContext context, WatchTogetherProvider watchTogether) {
+  unawaited(
+    showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      builder: (sheetContext) =>
+          ListenableBuilder(listenable: watchTogether, builder: (context, _) => _SessionSheet(watchTogether: watchTogether)),
     ),
   );
 }
 
 class _StartOrJoinSheet extends StatefulWidget {
-  final MusicJamProvider jam;
-  const _StartOrJoinSheet({required this.jam});
+  final WatchTogetherProvider watchTogether;
+  final MusicPlaybackService musicService;
+  final MultiServerProvider multiServer;
+
+  const _StartOrJoinSheet({required this.watchTogether, required this.musicService, required this.multiServer});
 
   @override
   State<_StartOrJoinSheet> createState() => _StartOrJoinSheetState();
@@ -111,7 +130,12 @@ class _StartOrJoinSheetState extends State<_StartOrJoinSheet> {
   Future<void> _create() async {
     setState(() => _busy = true);
     try {
-      await widget.jam.createSession(displayName: _displayName, relayEndpoint: _relayEndpoint);
+      await widget.watchTogether.createMusicJamSession(
+        musicService: widget.musicService,
+        multiServer: widget.multiServer,
+        relayEndpoint: _relayEndpoint,
+        displayName: _displayName,
+      );
       if (mounted) Navigator.of(context).pop();
     } catch (e, stackTrace) {
       appLogger.e('MusicJam: Failed to start jam from sheet', error: e, stackTrace: stackTrace);
@@ -126,7 +150,13 @@ class _StartOrJoinSheetState extends State<_StartOrJoinSheet> {
     if (code == null || !mounted) return;
     setState(() => _busy = true);
     try {
-      await widget.jam.joinSession(code, displayName: _displayName, relayEndpoint: _relayEndpoint);
+      await widget.watchTogether.joinMusicJamSession(
+        code,
+        musicService: widget.musicService,
+        multiServer: widget.multiServer,
+        relayEndpoint: _relayEndpoint,
+        displayName: _displayName,
+      );
       if (mounted) Navigator.of(context).pop();
     } catch (e, stackTrace) {
       appLogger.e('MusicJam: Failed to join jam from sheet', error: e, stackTrace: stackTrace);
@@ -223,14 +253,15 @@ class _JoinCodeDialogState extends State<_JoinCodeDialog> {
 }
 
 class _SessionSheet extends StatelessWidget {
-  final MusicJamProvider jam;
-  const _SessionSheet({required this.jam});
+  final WatchTogetherProvider watchTogether;
+  const _SessionSheet({required this.watchTogether});
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final session = jam.session;
+    final session = watchTogether.session;
     if (session == null) return const SizedBox.shrink();
+    final isMusic = watchTogether.isMusicJam;
 
     return SafeArea(
       child: Padding(
@@ -241,11 +272,28 @@ class _SessionSheet extends StatelessWidget {
           children: [
             Row(
               children: [
-                Icon(jam.isHost ? Symbols.star_rounded : Symbols.groups_rounded, color: theme.colorScheme.primary),
+                Icon(
+                  watchTogether.isHost ? Symbols.star_rounded : Symbols.groups_rounded,
+                  color: theme.colorScheme.primary,
+                ),
                 const SizedBox(width: 12),
-                Expanded(child: Text(jam.isHost ? 'Hosting a Jam' : 'In a Jam', style: theme.textTheme.titleLarge)),
+                Expanded(
+                  child: Text(
+                    isMusic
+                        ? (watchTogether.isHost ? 'Hosting a Jam' : 'In a Jam')
+                        : 'Watch Together session active',
+                    style: theme.textTheme.titleLarge,
+                  ),
+                ),
               ],
             ),
+            if (!isMusic) ...[
+              const SizedBox(height: 4),
+              Text(
+                'A video session is currently using this room. End it below before starting a music jam.',
+                style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+              ),
+            ],
             const SizedBox(height: 4),
             InkWell(
               onTap: () => _copyCode(context, session.sessionId),
@@ -267,9 +315,9 @@ class _SessionSheet extends StatelessWidget {
             ),
             const SizedBox(height: 16),
             const Divider(),
-            Text('Participants (${jam.participantCount})', style: theme.textTheme.titleSmall),
+            Text('Participants (${watchTogether.participantCount})', style: theme.textTheme.titleSmall),
             const SizedBox(height: 8),
-            ...jam.participants.map(
+            ...watchTogether.participants.map(
               (participant) => ListTile(
                 contentPadding: EdgeInsets.zero,
                 leading: CircleAvatar(
@@ -283,8 +331,11 @@ class _SessionSheet extends StatelessWidget {
                   ),
                 ),
                 title: Text(participant.displayName),
-                trailing: jam.canTransferHostTo(participant)
-                    ? TextButton(onPressed: () => _confirmTransfer(context, jam, participant), child: const Text('Make host'))
+                trailing: watchTogether.canTransferHostTo(participant)
+                    ? TextButton(
+                        onPressed: () => _confirmTransfer(context, watchTogether, participant),
+                        child: const Text('Make host'),
+                      )
                     : null,
               ),
             ),
@@ -294,9 +345,9 @@ class _SessionSheet extends StatelessWidget {
                 foregroundColor: theme.colorScheme.error,
                 side: BorderSide(color: theme.colorScheme.error),
               ),
-              onPressed: () => _confirmLeave(context, jam),
-              icon: Icon(jam.isHost ? Symbols.close_rounded : Symbols.logout_rounded),
-              label: Text(jam.isHost ? 'End Jam' : 'Leave Jam'),
+              onPressed: () => _confirmLeave(context, watchTogether),
+              icon: Icon(watchTogether.isHost ? Symbols.close_rounded : Symbols.logout_rounded),
+              label: Text(watchTogether.isHost ? 'End Session' : 'Leave Session'),
             ),
           ],
         ),
@@ -309,7 +360,7 @@ class _SessionSheet extends StatelessWidget {
     showSnackBar(context, 'Session code copied');
   }
 
-  Future<void> _confirmTransfer(BuildContext context, MusicJamProvider jam, Participant participant) async {
+  Future<void> _confirmTransfer(BuildContext context, WatchTogetherProvider watchTogether, Participant participant) async {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
@@ -321,16 +372,16 @@ class _SessionSheet extends StatelessWidget {
         ],
       ),
     );
-    if (confirmed == true) jam.transferHost(participant);
+    if (confirmed == true) watchTogether.transferHost(participant);
   }
 
-  Future<void> _confirmLeave(BuildContext context, MusicJamProvider jam) async {
-    final isHost = jam.isHost;
+  Future<void> _confirmLeave(BuildContext context, WatchTogetherProvider watchTogether) async {
+    final isHost = watchTogether.isHost;
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
-        title: Text(isHost ? 'End Jam?' : 'Leave Jam?'),
-        content: Text(isHost ? 'This will end the jam for everyone.' : 'You will stop listening together.'),
+        title: Text(isHost ? 'End session?' : 'Leave session?'),
+        content: Text(isHost ? 'This will end the session for everyone.' : 'You will stop listening/watching together.'),
         actions: [
           TextButton(onPressed: () => Navigator.of(context).pop(false), child: const Text('Cancel')),
           FilledButton(onPressed: () => Navigator.of(context).pop(true), child: Text(isHost ? 'End' : 'Leave')),
@@ -340,7 +391,7 @@ class _SessionSheet extends StatelessWidget {
     if (confirmed != true) return;
     if (context.mounted) Navigator.of(context).pop();
     unawaited(
-      jam.leaveSession().catchError((Object e, StackTrace stackTrace) {
+      watchTogether.leaveSession().catchError((Object e, StackTrace stackTrace) {
         appLogger.e('MusicJam: Leave from sheet failed', error: e, stackTrace: stackTrace);
       }),
     );

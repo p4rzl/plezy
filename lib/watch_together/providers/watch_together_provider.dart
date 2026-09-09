@@ -6,6 +6,9 @@ import 'package:flutter/foundation.dart';
 
 import '../../mpv/mpv.dart';
 import '../../i18n/strings.g.dart';
+import '../../media/media_item.dart';
+import '../../providers/multi_server_provider.dart';
+import '../../services/music/music_playback_service.dart';
 import '../../utils/app_logger.dart';
 import '../models/playback_state.dart';
 import '../models/sync_message.dart';
@@ -57,6 +60,29 @@ class WatchTogetherProvider with ChangeNotifier {
   bool _notifyScheduled = false;
   bool _disposed = false;
   int _sessionOperation = 0;
+
+  // Music Jam (Listen Together) support — shares this room/session/peer
+  // service with Watch Together so a device can only ever be in one room,
+  // video or music, at a time (creating either kind of session always
+  // leaves whatever was active first, see createSession/joinSession/
+  // createMusicJamSession/joinMusicJamSession). Video keeps its
+  // frame-accurate WatchTogetherController/AttachedPlayer; music drives
+  // MusicPlaybackService directly with coarse position correction, since
+  // audio doesn't need sub-second sync and aggressive micro-seeks would
+  // only add audible glitches.
+  static const Duration _musicHeartbeatInterval = Duration(seconds: 5);
+  static const int _musicDriftCorrectionThresholdMs = 4000;
+
+  MusicPlaybackService? _musicService;
+  MultiServerProvider? _multiServer;
+  Timer? _musicHeartbeatTimer;
+  int _musicOutgoingSeq = 0;
+  int _musicLastAppliedSeq = -1;
+  int _musicSwitchToken = 0;
+
+  /// Whether the active room (if any) is a Listen Together music jam rather
+  /// than a Watch Together video session.
+  bool get isMusicJam => _musicService != null;
 
   @override
   void notifyListeners() {
@@ -261,8 +287,17 @@ class WatchTogetherProvider with ChangeNotifier {
         _recoverableTransportError = null;
       }
 
-      _controller?.announceJoin(_displayName);
-      _controller?.onReconnected();
+      if (isMusicJam) {
+        _sendJoinAnnouncement();
+        if (isHost) {
+          _broadcastMusicState();
+        } else {
+          peerService.broadcast(SyncMessage.requestState(peerId: peerService.myPeerId));
+        }
+      } else {
+        _controller?.announceJoin(_displayName);
+        _controller?.onReconnected();
+      }
     };
   }
 
@@ -468,6 +503,123 @@ class WatchTogetherProvider with ChangeNotifier {
     }
   }
 
+  /// Create a Listen Together (music jam) session as host, seeded from
+  /// whatever [musicService] is currently playing. Shares this provider's
+  /// room/session machinery with Watch Together: this ends any active
+  /// session (video or music) first, so a device is never in two rooms at
+  /// once.
+  Future<String> createMusicJamSession({
+    required MusicPlaybackService musicService,
+    required MultiServerProvider multiServer,
+    required WatchTogetherRelayEndpoint relayEndpoint,
+    String? displayName,
+  }) async {
+    final cleanup = leaveSession();
+    final operation = _sessionOperation;
+    await cleanup;
+    if (_disposed || operation != _sessionOperation) throw StateError('Music Jam create became stale');
+    _playbackDispatcher.reset();
+
+    appLogger.d('WatchTogether: Creating music jam session');
+
+    final peerService = _peerServiceFactory(endpoint: relayEndpoint);
+    _peerService = peerService;
+    _setupPeerServiceListeners();
+
+    try {
+      final createdSessionId = await peerService.createSession();
+      if (!identical(_peerService, peerService) || _disposed) {
+        throw StateError('Music Jam create became stale');
+      }
+      _session = WatchSession.createAsHost(
+        sessionId: createdSessionId,
+        hostPeerId: peerService.hostPeerId!,
+        controlMode: ControlMode.hostOnly,
+      ).copyWith(state: SessionState.connected, role: peerService.isHost ? SessionRole.host : SessionRole.guest);
+
+      _displayName = displayName ?? _generateDisplayName();
+      _participants.add(
+        Participant(peerId: peerService.myPeerId!, displayName: _displayName, isHost: peerService.isHost),
+      );
+
+      _musicService = musicService;
+      _multiServer = multiServer;
+      musicService.addListener(_onLocalMusicChanged);
+      _wireReconnectHandler();
+      _startMusicHeartbeat();
+      _broadcastMusicState();
+
+      notifyListeners();
+      appLogger.d('WatchTogether: Music jam session created: $createdSessionId');
+      return createdSessionId;
+    } catch (e) {
+      appLogger.e('WatchTogether: Failed to create music jam session', error: e);
+      if (identical(_peerService, peerService)) await leaveSession();
+      rethrow;
+    }
+  }
+
+  /// Join an existing Listen Together (music jam) session by its room code.
+  Future<void> joinMusicJamSession(
+    String sessionId, {
+    required MusicPlaybackService musicService,
+    required MultiServerProvider multiServer,
+    required WatchTogetherRelayEndpoint relayEndpoint,
+    String? displayName,
+  }) async {
+    final cleanup = leaveSession();
+    final operation = _sessionOperation;
+    await cleanup;
+    if (_disposed || operation != _sessionOperation) throw StateError('Music Jam join became stale');
+    _playbackDispatcher.reset();
+
+    appLogger.d('WatchTogether: Joining music jam session: $sessionId');
+
+    final peerService = _peerServiceFactory(endpoint: relayEndpoint);
+    _peerService = peerService;
+    _setupPeerServiceListeners();
+
+    final joiningSession = WatchSession.joinAsGuest(sessionId: sessionId);
+    _session = joiningSession;
+    notifyListeners();
+
+    try {
+      await peerService.joinSession(sessionId);
+      if (!identical(_peerService, peerService)) {
+        throw StateError('Music Jam join became stale');
+      }
+
+      _session = joiningSession.copyWith(
+        state: SessionState.connected,
+        hostPeerId: peerService.hostPeerId,
+        role: peerService.isHost ? SessionRole.host : SessionRole.guest,
+      );
+
+      _displayName = displayName ?? _generateDisplayName();
+
+      _musicService = musicService;
+      _multiServer = multiServer;
+      musicService.addListener(_onLocalMusicChanged);
+      _wireReconnectHandler();
+
+      _participants.add(
+        Participant(peerId: peerService.myPeerId!, displayName: _displayName, isHost: peerService.isHost),
+      );
+
+      _sendJoinAnnouncement();
+      peerService.broadcast(SyncMessage.requestState(peerId: peerService.myPeerId));
+
+      notifyListeners();
+      appLogger.d('WatchTogether: Joined music jam session successfully');
+    } catch (e) {
+      appLogger.e('WatchTogether: Failed to join music jam session', error: e);
+      if (identical(_peerService, peerService)) {
+        await leaveSession();
+      }
+      rethrow;
+    }
+  }
+
   /// Enter a room by code — joins a room that still has someone in it and
   /// hosts the code otherwise.
   Future<void> enterRoom(
@@ -532,6 +684,10 @@ class WatchTogetherProvider with ChangeNotifier {
     _sessionOperation++;
     _recoverableTransportError = null;
     if (announceLeave) _controller?.announceLeave();
+    if (announceLeave && isMusicJam) {
+      final myPeerId = _peerService?.myPeerId;
+      if (myPeerId != null) _peerService?.broadcast(SyncMessage.leave(peerId: myPeerId));
+    }
 
     final peerService = _peerService;
     if (peerService != null) peerService.onReconnected = null;
@@ -557,6 +713,12 @@ class WatchTogetherProvider with ChangeNotifier {
 
     _controller?.dispose();
     _controller = null;
+    _musicService?.removeListener(_onLocalMusicChanged);
+    _musicService = null;
+    _multiServer = null;
+    _musicHeartbeatTimer?.cancel();
+    _musicHeartbeatTimer = null;
+    _musicLastAppliedSeq = -1;
     _peerService = null;
     _session = null;
     _participants.clear();
@@ -846,9 +1008,24 @@ class WatchTogetherProvider with ChangeNotifier {
       // hostExitedPlayer is routed through the controller's ordered message
       // queue so it can't overtake (or be overtaken by) state messages.
 
+      case SyncMessageType.requestState:
+        if (isMusicJam && isHost) _sendMusicStateTo(message.peerId);
+        break;
+
+      case SyncMessageType.state:
+        if (isMusicJam && !isHost && message.state != null) {
+          unawaited(
+            _applyRemoteMusicState(message.state!).catchError((Object e, StackTrace stackTrace) {
+              appLogger.w('WatchTogether: Failed to apply remote music jam state', error: e, stackTrace: stackTrace);
+            }),
+          );
+        }
+        break;
+
       default:
-        // Playback sync messages (state/status/control/...) are handled by
-        // the session controller.
+        // Video playback sync messages (state/status/control/...) are
+        // handled by the session controller; music jam's own state/
+        // requestState messages are handled above.
         break;
     }
   }
@@ -1014,13 +1191,23 @@ class WatchTogetherProvider with ChangeNotifier {
     _controller?.applyHostChange(updated);
 
     if (amHost && !wasHost) {
-      // Re-announce as host — the lobby-safe carrier that teaches guests the
-      // room's control mode now comes from this peer.
-      _controller?.announceJoin(_displayName);
+      if (isMusicJam) {
+        _sendJoinAnnouncement();
+        _startMusicHeartbeat();
+        _broadcastMusicState();
+      } else {
+        // Re-announce as host — the lobby-safe carrier that teaches guests the
+        // room's control mode now comes from this peer.
+        _controller?.announceJoin(_displayName);
+      }
       _participantEventController.add(
         ParticipantEvent(displayName: _displayName, type: ParticipantEventType.becameHost),
       );
     } else if (!amHost) {
+      if (isMusicJam) {
+        _musicHeartbeatTimer?.cancel();
+        _musicHeartbeatTimer = null;
+      }
       _participantEventController.add(
         ParticipantEvent(
           displayName: _displayNameForPeer(newHostPeerId) ?? '?',
@@ -1082,6 +1269,144 @@ class WatchTogetherProvider with ChangeNotifier {
       _isWaitingForHostReconnect = false;
       appLogger.d('WatchTogether: Host reconnected, grace period cancelled');
       notifyListeners();
+    }
+  }
+
+  void _sendJoinAnnouncement() {
+    final peerService = _peerService;
+    final myPeerId = peerService?.myPeerId;
+    if (peerService == null || myPeerId == null) return;
+    peerService.broadcast(SyncMessage.join(peerId: myPeerId, displayName: _displayName, isHost: isHost));
+  }
+
+  void _onLocalMusicChanged() {
+    if (_disposed || !isMusicJam || !isHost) return;
+    _broadcastMusicState();
+  }
+
+  void _startMusicHeartbeat() {
+    _musicHeartbeatTimer?.cancel();
+    _musicHeartbeatTimer = Timer.periodic(_musicHeartbeatInterval, (_) {
+      if (_disposed || !isMusicJam || !isHost) return;
+      _broadcastMusicState();
+    });
+  }
+
+  PlaybackState? _buildMusicState() {
+    final peerService = _peerService;
+    final musicService = _musicService;
+    final track = musicService?.currentTrack;
+    final serverId = track?.serverId;
+    if (peerService == null || musicService == null || track == null || serverId == null) return null;
+    _musicOutgoingSeq++;
+    return PlaybackState(
+      seq: _musicOutgoingSeq,
+      ratingKey: track.id,
+      serverId: serverId,
+      mediaTitle: track.displayTitle,
+      phase: musicService.isPlaying ? PlaybackPhase.playing : PlaybackPhase.paused,
+      anchorPositionMs: musicService.position.inMilliseconds,
+      anchorHostTimeMs: DateTime.now().millisecondsSinceEpoch,
+      rate: 1.0,
+      controlMode: ControlMode.hostOnly,
+      actorPeerId: peerService.myPeerId,
+    );
+  }
+
+  /// Broadcast the host's authoritative music jam state (on change and on
+  /// heartbeat). Positions are compared without any clock-offset
+  /// correction — unlike Watch Together's ping/pong clock sync, a jam has
+  /// no need for millisecond accuracy, and treating
+  /// [PlaybackState.anchorPositionMs] as the target directly (rather than
+  /// extrapolating from [PlaybackState.anchorHostTimeMs]) avoids depending
+  /// on host and guest wall clocks agreeing.
+  void _broadcastMusicState() {
+    final peerService = _peerService;
+    final state = _buildMusicState();
+    final serverId = state != null ? serverIdOrNull(state.serverId) : null;
+    if (peerService == null || state == null || serverId == null) return;
+    peerService.broadcast(SyncMessage.state(state, peerId: peerService.myPeerId));
+    _updateCurrentPlaybackSnapshot(ratingKey: state.ratingKey, serverId: serverId, mediaTitle: state.mediaTitle ?? '');
+    notifyListeners();
+  }
+
+  void _sendMusicStateTo(String? peerId) {
+    if (peerId == null) return;
+    final peerService = _peerService;
+    final musicService = _musicService;
+    final track = musicService?.currentTrack;
+    final serverId = track?.serverId;
+    if (peerService == null || musicService == null || track == null || serverId == null) return;
+    final state = PlaybackState(
+      seq: _musicOutgoingSeq,
+      ratingKey: track.id,
+      serverId: serverId,
+      mediaTitle: track.displayTitle,
+      phase: musicService.isPlaying ? PlaybackPhase.playing : PlaybackPhase.paused,
+      anchorPositionMs: musicService.position.inMilliseconds,
+      anchorHostTimeMs: DateTime.now().millisecondsSinceEpoch,
+      rate: 1.0,
+      controlMode: ControlMode.hostOnly,
+      actorPeerId: peerService.myPeerId,
+    );
+    peerService.sendTo(peerId, SyncMessage.state(state, peerId: peerService.myPeerId));
+  }
+
+  /// Apply the host's broadcast state (guest only): switch track when it
+  /// differs, otherwise just match play/pause and nudge position back in
+  /// line once drift crosses [_musicDriftCorrectionThresholdMs].
+  Future<void> _applyRemoteMusicState(PlaybackState state) async {
+    final musicService = _musicService;
+    final multiServer = _multiServer;
+    if (musicService == null || multiServer == null) return;
+    if (_musicLastAppliedSeq != -1 && state.seq <= _musicLastAppliedSeq) return;
+    _musicLastAppliedSeq = state.seq;
+
+    final serverIdTyped = serverIdOrNull(state.serverId);
+    if (serverIdTyped != null) {
+      _updateCurrentPlaybackSnapshot(ratingKey: state.ratingKey, serverId: serverIdTyped, mediaTitle: state.mediaTitle ?? '');
+      notifyListeners();
+    }
+
+    final targetPositionMs = state.anchorPositionMs;
+    final currentTrack = musicService.currentTrack;
+    final onTrack = currentTrack != null && currentTrack.id == state.ratingKey && currentTrack.serverId == state.serverId;
+
+    if (!onTrack) {
+      final token = ++_musicSwitchToken;
+      if (serverIdTyped == null) return;
+      final client = multiServer.getClientForServer(serverIdTyped);
+      if (client == null) {
+        appLogger.w('WatchTogether: Server ${state.serverId} unavailable for music jam track switch');
+        return;
+      }
+      MediaItem? track;
+      try {
+        track = await client.fetchItem(state.ratingKey);
+      } catch (e, stackTrace) {
+        appLogger.w('WatchTogether: Could not fetch music jam track ${state.ratingKey}', error: e, stackTrace: stackTrace);
+        return;
+      }
+      if (_disposed || token != _musicSwitchToken || !identical(_musicService, musicService) || track == null) return;
+      await musicService.playFromList(
+        tracks: [track],
+        playContext: MusicPlayContext(title: state.mediaTitle ?? track.displayTitle, kind: MusicPlayContextKind.tracks),
+        initialPosition: Duration(milliseconds: targetPositionMs),
+      );
+      if (_disposed || token != _musicSwitchToken || !identical(_musicService, musicService)) return;
+      if (state.phase == PlaybackPhase.paused) await musicService.pause();
+      return;
+    }
+
+    if (state.phase == PlaybackPhase.playing && !musicService.isPlaying) {
+      await musicService.play();
+    } else if (state.phase == PlaybackPhase.paused && musicService.isPlaying) {
+      await musicService.pause();
+    }
+
+    final drift = (musicService.position.inMilliseconds - targetPositionMs).abs();
+    if (drift > _musicDriftCorrectionThresholdMs) {
+      await musicService.seek(Duration(milliseconds: targetPositionMs));
     }
   }
 
