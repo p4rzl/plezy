@@ -846,6 +846,41 @@ jobs:
           cd "$BUNDLE_DIR"
           tar -czf "$GITHUB_WORKSPACE/plezy-linux-${{ matrix.arch }}.tar.gz" *
 
+      # Wraps the exact same bundle the tarball/deb/rpm packages ship (already
+      # verified self-contained by the host-dep check above) in a minimal
+      # AppDir: AppRun just execs the bundle's own plezy.sh, which already
+      # resolves every path relative to its own directory - the "portable
+      # tarball" branch it supports doubles as the AppImage launch path with
+      # no changes. appimagetool runs pre-extracted (--appimage-extract) so
+      # this doesn't depend on FUSE being available on the runner.
+      - name: Build AppImage
+        shell: bash
+        run: |
+          set -euo pipefail
+          APPDIR="$GITHUB_WORKSPACE/AppDir"
+          rm -rf "$APPDIR"
+          mkdir -p "$APPDIR/usr"
+          cp -a "$BUNDLE_DIR"/. "$APPDIR/usr/"
+          cp linux/packaging/com.edde746.plezy.desktop "$APPDIR/plezy.desktop"
+          cp assets/plezy.png "$APPDIR/plezy.png"
+          cp assets/plezy.png "$APPDIR/.DirIcon"
+          cat > "$APPDIR/AppRun" << 'APPRUN_EOF'
+          #!/usr/bin/env bash
+          HERE="$(dirname "$(readlink -f "${0}")")"
+          exec "$HERE/usr/plezy.sh" "$@"
+          APPRUN_EOF
+          chmod +x "$APPDIR/AppRun"
+
+          if [[ "${{ matrix.arch }}" == "x64" ]]; then
+            APPIMAGETOOL_ARCH=x86_64
+          else
+            APPIMAGETOOL_ARCH=aarch64
+          fi
+          curl -fL "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${APPIMAGETOOL_ARCH}.AppImage" -o appimagetool.AppImage
+          chmod +x appimagetool.AppImage
+          ./appimagetool.AppImage --appimage-extract >/dev/null
+          ARCH="$APPIMAGETOOL_ARCH" ./squashfs-root/AppRun "$APPDIR" "$GITHUB_WORKSPACE/plezy-linux-${{ matrix.arch }}.AppImage"
+
       - name: Attest Linux ${{ matrix.arch }} artifacts
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4
         with:
@@ -854,6 +889,7 @@ jobs:
             plezy-linux-${{ matrix.arch }}.deb
             plezy-linux-${{ matrix.arch }}.rpm
             plezy-linux-${{ matrix.arch }}.pkg.tar.zst
+            plezy-linux-${{ matrix.arch }}.AppImage
 
       - name: Upload Linux ${{ matrix.arch }} artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -864,6 +900,7 @@ jobs:
             plezy-linux-${{ matrix.arch }}.deb
             plezy-linux-${{ matrix.arch }}.rpm
             plezy-linux-${{ matrix.arch }}.pkg.tar.zst
+            plezy-linux-${{ matrix.arch }}.AppImage
 
   create-release:
     needs: [validate-trusted-ref, build-android, build-ios, build-macos, build-windows, package-windows, build-linux]
